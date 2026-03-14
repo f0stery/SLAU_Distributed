@@ -1,52 +1,53 @@
+import argparse
+import os
+
 import numpy as np
-from pathlib import Path
 
 
-def generate_system(n: int, seed: int = 42):
+def generate_well_conditioned_system(n: int, seed: int = 42):
     rng = np.random.default_rng(seed)
-
-    # Диагонально доминирующая матрица => устойчивая и невырожденная
-    A = rng.random((n, n)) * 10.0
-    A += np.eye(n) * (n + 10)
-
-    x_true = rng.random(n) * 10.0
+    M = rng.standard_normal((n, n))
+    A = M.T @ M + n * np.eye(n)
+    x_true = rng.standard_normal(n)
     b = A @ x_true
-
     return A, b, x_true
 
 
 def save_matrix(path: str, A: np.ndarray):
-    n = A.shape[0]
     with open(path, "w", encoding="utf-8") as f:
+        n = A.shape[0]
         f.write(f"{n}\n")
-        for i in range(n):
-            row = " ".join(f"{x:.10f}" for x in A[i])
-            f.write(row + "\n")
+        for row in A:
+            f.write(" ".join(f"{x:.12g}" for x in row) + "\n")
 
 
 def save_vector(path: str, b: np.ndarray):
-    n = len(b)
     with open(path, "w", encoding="utf-8") as f:
+        n = b.shape[0]
         f.write(f"{n}\n")
         for x in b:
-            f.write(f"{x:.10f}\n")
+            f.write(f"{x:.12g}\n")
 
 
-def main():
-    data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
-
-    n = 50  # можешь менять: 10, 50, 100, 200, 500
-    A, b, x_true = generate_system(n)
-
-    save_matrix(data_dir / "matrix.txt", A)
-    save_vector(data_dir / "vector.txt", b)
-
-    print(f"Сгенерирована система размерности {n}")
-    print("Файлы обновлены:")
-    print(" - data/matrix.txt")
-    print(" - data/vector.txt")
+def save_nodes(path: str, nodes):
+    with open(path, "w", encoding="utf-8") as f:
+        for host, port in nodes:
+            f.write(f"{host}:{port}\n")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n", type=int, default=100)
+    parser.add_argument("--out-dir", default="data")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    A, b, _ = generate_well_conditioned_system(args.n, seed=args.seed)
+
+    save_matrix(os.path.join(args.out_dir, "matrix.txt"), A)
+    save_vector(os.path.join(args.out_dir, "vector.txt"), b)
+    save_nodes(os.path.join(args.out_dir, "nodes.txt"), [("127.0.0.1", 5001), ("127.0.0.1", 5002)])
+
+    print(f"Сгенерированы данные для n={args.n} в папке {args.out_dir}")
