@@ -4,6 +4,8 @@ import socket
 import struct
 import time
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import numpy as np
 
@@ -75,10 +77,13 @@ def back_substitution(R: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------
-# Distributed MGS (stateful workers)
+# Distributed MGS (simplified logging)
 # ---------------------------
 
 def distributed_mgs_stateful(A: np.ndarray, b: np.ndarray, nodes: List[Tuple[str, int]], verbose: bool = True) -> np.ndarray:
+    """
+    Распределённый MGS с параллельным опросом worker'ов.
+    """
     A = np.asarray(A, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
 
@@ -93,8 +98,9 @@ def distributed_mgs_stateful(A: np.ndarray, b: np.ndarray, nodes: List[Tuple[str
     p = len(nodes)
     ranges = split_rows(m, p)
 
-    # 1) INIT: загружаем данные на workers один раз
-    for (host, port), (rs, re) in zip(nodes, ranges):
+    print(f"\n[MGS] Инициализация {p} workers...")
+    for idx, ((host, port), (rs, re)) in enumerate(zip(nodes, ranges)):
+        print(f"  Worker {idx+1}: {host}:{port}, строки {rs}-{re}")
         payload = {
             "cmd": "init_data",
             "A_chunk": A[rs:re, :],
@@ -103,78 +109,158 @@ def distributed_mgs_stateful(A: np.ndarray, b: np.ndarray, nodes: List[Tuple[str
             "row_end": re,
         }
         send_task(host, port, payload, timeout=300.0)
+    print(f"[MGS] Инициализация завершена")
 
     R = np.zeros((n, n), dtype=np.float64)
     y = np.zeros(n, dtype=np.float64)
 
-    # 2) Основной цикл MGS
-    for k in range(n):
-        if verbose and (n <= 20 or k % max(1, n // 20) == 0):
-            print(f"[MGS] шаг {k + 1}/{n}")
+    print(f"\n[MGS] Запуск основного цикла (n={n})...")
+    start_time = time.perf_counter()
 
-        # 2.1) Собрать k-й столбец и норму
-        col_global = np.zeros(m, dtype=np.float64)
-        norm_sq = 0.0
+    # Создаем пул потоков для параллельных запросов
+    with ThreadPoolExecutor(max_workers=p) as executor:
+        for k in range(n):
+            if verbose and (n <= 20 or (k+1) % 100 == 0 or k == 0):
+                print(f"  Шаг {k + 1}/{n}")
 
-        for (host, port), (rs, re) in zip(nodes, ranges):
-            resp = send_task(host, port, {"cmd": "get_col_norm", "k": k}, timeout=300.0)
-            col_local = np.asarray(resp["col_local"], dtype=np.float64)
-            norm_sq += float(resp["norm_sq_local"])
-            col_global[rs:re] = col_local
+            # ===== 1. ПАРАЛЛЕЛЬНЫЙ СБОР СТОЛБЦА И НОРМЫ =====
+            col_global = np.zeros(m, dtype=np.float64)
+            norm_sq = 0.0
+            results = [None] * p
 
-        norm = np.sqrt(norm_sq)
-        if norm < 1e-15:
-            raise np.linalg.LinAlgError(f"Матрица вырождена или почти вырождена на шаге k={k}")
+            def get_col_task(idx, host, port, rs, re, k):
+                try:
+                    resp = send_task(host, port, {"cmd": "get_col_norm", "k": k}, timeout=300.0)
+                    return idx, rs, re, resp
+                except Exception as e:
+                    print(f"  Ошибка worker {host}:{port}: {e}")
+                    return idx, rs, re, None
 
-        R[k, k] = norm
-        q_global = col_global / norm
+            futures = []
+            for idx, ((host, port), (rs, re)) in enumerate(zip(nodes, ranges)):
+                future = executor.submit(get_col_task, idx, host, port, rs, re, k)
+                futures.append(future)
 
-        # 2.2) y[k] = q_k^T b
-        yk = 0.0
-        for (host, port), (rs, re) in zip(nodes, ranges):
-            q_local = q_global[rs:re]
-            resp = send_task(host, port, {"cmd": "compute_yk", "q_local": q_local}, timeout=300.0)
-            yk += float(resp["yk_local"])
-        y[k] = yk
+            for future in as_completed(futures):
+                idx, rs, re, resp = future.result()
+                if resp is not None:
+                    col_local = np.asarray(resp["col_local"], dtype=np.float64)
+                    norm_sq += float(resp["norm_sq_local"])
+                    col_global[rs:re] = col_local
+                    results[idx] = True
 
-        # 2.3) r[k, k+1:] = q_k^T A[:, k+1:]
-        tail_len = n - (k + 1)
-        if tail_len > 0:
-            r_tail = np.zeros(tail_len, dtype=np.float64)
+            if not all(results):
+                raise RuntimeError("Не все worker'ы вернули результат")
 
-            for (host, port), (rs, re) in zip(nodes, ranges):
-                q_local = q_global[rs:re]
-                resp = send_task(
-                    host,
-                    port,
-                    {
-                        "cmd": "compute_dots",
-                        "k": k,
-                        "q_local": q_local,
-                    },
-                    timeout=300.0
-                )
-                dots_local = np.asarray(resp["dots_local"], dtype=np.float64)
-                r_tail += dots_local
+            norm = np.sqrt(norm_sq)
+            if norm < 1e-15:
+                raise np.linalg.LinAlgError(f"Матрица вырождена на шаге k={k}")
 
-            R[k, (k + 1):] = r_tail
+            R[k, k] = norm
+            q_global = col_global / norm
 
-            # 2.4) A[:, k+1:] -= q_k * r_tail
-            for (host, port), (rs, re) in zip(nodes, ranges):
-                q_local = q_global[rs:re]
-                send_task(
-                    host,
-                    port,
-                    {
-                        "cmd": "update_tail",
-                        "k": k,
-                        "q_local": q_local,
-                        "r_tail": r_tail,
-                    },
-                    timeout=300.0
-                )
+            # ===== 2. ПАРАЛЛЕЛЬНОЕ ВЫЧИСЛЕНИЕ y[k] =====
+            yk = 0.0
+            results = [None] * p
 
-    # 3) Решаем R x = y
+            def compute_yk_task(idx, host, port, rs, re, q_global):
+                try:
+                    q_local = q_global[rs:re]
+                    resp = send_task(host, port, {"cmd": "compute_yk", "q_local": q_local}, timeout=300.0)
+                    return idx, resp
+                except Exception as e:
+                    print(f"  Ошибка worker {host}:{port}: {e}")
+                    return idx, None
+
+            futures = []
+            for idx, ((host, port), (rs, re)) in enumerate(zip(nodes, ranges)):
+                future = executor.submit(compute_yk_task, idx, host, port, rs, re, q_global)
+                futures.append(future)
+
+            for future in as_completed(futures):
+                idx, resp = future.result()
+                if resp is not None:
+                    yk += float(resp["yk_local"])
+                    results[idx] = True
+
+            if not all(results):
+                raise RuntimeError("Не все worker'ы вернули результат")
+            y[k] = yk
+
+            # ===== 3. ПАРАЛЛЕЛЬНОЕ ВЫЧИСЛЕНИЕ СКАЛЯРНЫХ ПРОИЗВЕДЕНИЙ =====
+            tail_len = n - (k + 1)
+            if tail_len > 0:
+                r_tail = np.zeros(tail_len, dtype=np.float64)
+                results = [None] * p
+
+                def compute_dots_task(idx, host, port, rs, re, q_global, k):
+                    try:
+                        q_local = q_global[rs:re]
+                        resp = send_task(
+                            host,
+                            port,
+                            {
+                                "cmd": "compute_dots",
+                                "k": k,
+                                "q_local": q_local,
+                            },
+                            timeout=300.0
+                        )
+                        return idx, resp
+                    except Exception as e:
+                        print(f"  Ошибка worker {host}:{port}: {e}")
+                        return idx, None
+
+                futures = []
+                for idx, ((host, port), (rs, re)) in enumerate(zip(nodes, ranges)):
+                    future = executor.submit(compute_dots_task, idx, host, port, rs, re, q_global, k)
+                    futures.append(future)
+
+                for future in as_completed(futures):
+                    idx, resp = future.result()
+                    if resp is not None:
+                        dots_local = np.asarray(resp["dots_local"], dtype=np.float64)
+                        r_tail += dots_local
+                        results[idx] = True
+
+                if not all(results):
+                    raise RuntimeError("Не все worker'ы вернули результат")
+
+                R[k, (k + 1):] = r_tail
+
+                # ===== 4. ПАРАЛЛЕЛЬНОЕ ОБНОВЛЕНИЕ =====
+                def update_task(host, port, rs, re, q_global, r_tail, k):
+                    try:
+                        q_local = q_global[rs:re]
+                        send_task(
+                            host,
+                            port,
+                            {
+                                "cmd": "update_tail",
+                                "k": k,
+                                "q_local": q_local,
+                                "r_tail": r_tail,
+                            },
+                            timeout=300.0
+                        )
+                        return True
+                    except Exception as e:
+                        print(f"  Ошибка worker {host}:{port}: {e}")
+                        return False
+
+                futures = []
+                for (host, port), (rs, re) in zip(nodes, ranges):
+                    future = executor.submit(update_task, host, port, rs, re, q_global, r_tail, k)
+                    futures.append(future)
+
+                update_results = [f.result() for f in futures]
+                if not all(update_results):
+                    raise RuntimeError("Не все worker'ы выполнили обновление")
+
+    total_time = time.perf_counter() - start_time
+    print(f"\n[MGS] Основной цикл завершен за {total_time:.2f} с")
+
+    # Решаем R x = y
     x = back_substitution(R, y)
     return x
 
@@ -183,57 +269,67 @@ def distributed_mgs_stateful(A: np.ndarray, b: np.ndarray, nodes: List[Tuple[str
 # Main runner
 # ---------------------------
 
-def run_from_files(matrix_path: str, vector_path: str, nodes_path: str, use_numpy_gauss_large: bool = True):
+def run_from_files(matrix_path: str, vector_path: str, nodes_path: str):
+    print("\n" + "=" * 60)
+    print("ЗАПУСК MASTER.PY")
+    print("=" * 60)
+
+    print("\nЗагрузка данных...")
     A = load_matrix(matrix_path)
     b = load_vector(vector_path)
     nodes = load_nodes(nodes_path)
 
     n = A.shape[0]
-    print(f"Размерность системы: {n}")
-    print(f"Узлов: {len(nodes)}")
+    print(f"  Размерность системы: {n}")
+    print(f"  Узлов: {len(nodes)}")
 
-    # Гаусс / эталон
+    # Гаусс
+    print("\nРешение методом Гаусса...")
     t0 = time.perf_counter()
-    if use_numpy_gauss_large and n >= 1000:
-        x_gauss = np.linalg.solve(A, b)
-        gauss_label = "NumPy solve (LAPACK)"
-    else:
-        x_gauss = solve_gauss(A, b)
-        gauss_label = "Гаусс (последовательный)"
+    x_gauss = solve_gauss(A, b)
     t_gauss = time.perf_counter() - t0
+    print(f"  Время: {t_gauss:.3f} с")
 
     # Последовательный MGS
+    print("\nРешение последовательным MGS...")
     t0 = time.perf_counter()
     x_mgs_seq = solve_mgs(A, b)
     t_mgs_seq = time.perf_counter() - t0
+    print(f"  Время: {t_mgs_seq:.3f} с")
 
     # Распределённый MGS
+    print("\nРешение распределённым MGS...")
     t0 = time.perf_counter()
     x_mgs_dist = distributed_mgs_stateful(A, b, nodes, verbose=True)
     t_mgs_dist = time.perf_counter() - t0
+    print(f"  Время: {t_mgs_dist:.3f} с")
 
     # Невязки
     r_gauss = np.linalg.norm(A @ x_gauss - b)
     r_mgs_seq = np.linalg.norm(A @ x_mgs_seq - b)
     r_mgs_dist = np.linalg.norm(A @ x_mgs_dist - b)
 
-    # Различие решений
-    d_seq = np.linalg.norm(x_gauss - x_mgs_seq)
-    d_dist = np.linalg.norm(x_gauss - x_mgs_dist)
+    print("\n" + "=" * 60)
+    print("РЕЗУЛЬТАТЫ")
+    print("=" * 60)
 
-    print("\n=== Время выполнения ===")
-    print(f"{gauss_label}: {t_gauss:.6f} c")
-    print(f"MGS   (последовательный): {t_mgs_seq:.6f} c")
-    print(f"MGS   (распределённый):   {t_mgs_dist:.6f} c")
+    print("\nВремя выполнения:")
+    print(f"  Гаусс (последовательный): {t_gauss:.6f} с")
+    print(f"  MGS (последовательный): {t_mgs_seq:.6f} с")
+    print(f"  MGS (распределённый): {t_mgs_dist:.6f} с")
 
-    print("\n=== Невязки ===")
-    print(f"||A*x_gauss - b||    = {r_gauss:.6e}")
-    print(f"||A*x_mgs_seq - b||  = {r_mgs_seq:.6e}")
-    print(f"||A*x_mgs_dist - b|| = {r_mgs_dist:.6e}")
+    if t_mgs_dist > 0:
+        print(f"\nУскорение (посл. MGS / распред. MGS): {t_mgs_seq / t_mgs_dist:.6f}x")
+        print(f"Ускорение (Гаусс / распред. MGS): {t_gauss / t_mgs_dist:.6f}x")
 
-    print("\n=== Различие решений ===")
-    print(f"||x_gauss - x_mgs_seq||  = {d_seq:.6e}")
-    print(f"||x_gauss - x_mgs_dist|| = {d_dist:.6e}")
+    print("\nНевязки ||Ax-b||:")
+    print(f"  Гаусс: {r_gauss:.6e}")
+    print(f"  MGS последовательный: {r_mgs_seq:.6e}")
+    print(f"  MGS распределённый: {r_mgs_dist:.6e}")
+
+    print("\n" + "=" * 60)
+    print("ВЫПОЛНЕНИЕ ЗАВЕРШЕНО")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
@@ -241,12 +337,10 @@ if __name__ == "__main__":
     parser.add_argument("--matrix", default="data/matrix.txt", help="Файл матрицы")
     parser.add_argument("--vector", default="data/vector.txt", help="Файл вектора b")
     parser.add_argument("--nodes", default="data/nodes.txt", help="Файл списка worker-узлов")
-    parser.add_argument("--no-numpy-gauss-large", action="store_true", help="Не использовать np.linalg.solve для больших n")
     args = parser.parse_args()
 
     run_from_files(
         args.matrix,
         args.vector,
-        args.nodes,
-        use_numpy_gauss_large=not args.no_numpy_gauss_large
+        args.nodes
     )

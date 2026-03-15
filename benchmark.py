@@ -1,7 +1,6 @@
 import argparse
 import time
 from typing import List, Tuple
-
 import numpy as np
 
 from gauss_solver import solve_gauss
@@ -19,82 +18,150 @@ def generate_well_conditioned_system(n: int, seed: int = 42):
 
 
 def run_benchmark(
-    sizes: List[int],
-    nodes: List[Tuple[str, int]],
-    dist_limit: int,
-    use_numpy_gauss_large: bool = True
+        sizes: List[int],
+        nodes: List[Tuple[str, int]],
+        dist_limit: int,
+        use_numpy_gauss_large: bool = True
 ):
-    for n in sizes:
+    total_tests = len(sizes)
+
+    print("\n" + "=" * 60)
+    print("ЗАПУСК НАГРУЗОЧНОГО ТЕСТИРОВАНИЯ")
+    print("=" * 60)
+    print(f"Всего тестов: {total_tests}")
+    print(f"Worker'ы: {len(nodes)}")
+    print(f"dist-limit: {dist_limit}")
+    print("=" * 60)
+
+    results = []
+
+    for test_idx, n in enumerate(sizes, 1):
         print("\n" + "=" * 60)
-        print(f"ТЕСТ: размерность {n}")
+        print(f"ТЕСТ {test_idx}/{total_tests}: размерность {n}")
         print("=" * 60)
 
+        # Генерация системы
+        print(f"\nГенерация системы размерности {n}...")
+        gen_start = time.perf_counter()
         A, b, x_true = generate_well_conditioned_system(n, seed=42 + n)
+        gen_time = time.perf_counter() - gen_start
+        print(f"  Время: {gen_time:.3f} с")
+        print(f"  Число обусловленности: {np.linalg.cond(A):.2e}")
 
-        # Гаусс / эталон
+        # Гаусс
+        print(f"\nРешение методом Гаусса...")
         t0 = time.perf_counter()
-        if use_numpy_gauss_large and n >= 1000:
-            x_gauss = np.linalg.solve(A, b)
-            gauss_label = "NumPy solve (LAPACK)"
-        else:
-            x_gauss = solve_gauss(A, b)
-            gauss_label = "Гаусс (последовательный)"
+        x_gauss = solve_gauss(A, b)
+        gauss_label = "Гаусс (последовательный)"
         t_gauss = time.perf_counter() - t0
+        print(f"  Время: {t_gauss:.3f} с")
 
         # Последовательный MGS
+        print(f"\nРешение последовательным MGS...")
         t0 = time.perf_counter()
         x_mgs_seq = solve_mgs(A, b)
         t_mgs_seq = time.perf_counter() - t0
+        print(f"  Время: {t_mgs_seq:.3f} с")
 
         # Распределённый MGS
         x_mgs_dist = None
         t_mgs_dist = None
+        speedup_seq = None
+        speedup_gauss = None
 
         if nodes and n <= dist_limit:
+            print(f"\nРешение распределённым MGS...")
+            print(f"  Worker'ы: {len(nodes)}")
+
             t0 = time.perf_counter()
-            x_mgs_dist = distributed_mgs_stateful(A, b, nodes, verbose=False)
+            x_mgs_dist = distributed_mgs_stateful(A, b, nodes, verbose=True)
             t_mgs_dist = time.perf_counter() - t0
 
-        # Невязки
+            speedup_seq = t_mgs_seq / t_mgs_dist if t_mgs_dist > 0 else 0
+            speedup_gauss = t_gauss / t_mgs_dist if t_mgs_dist > 0 else 0
+
+            print(f"  Время: {t_mgs_dist:.3f} с")
+            print(f"  Ускорение (посл. MGS / распред. MGS): {speedup_seq:.2f}x")
+            print(f"  Ускорение (Гаусс / распред. MGS): {speedup_gauss:.2f}x")
+        else:
+            if n > dist_limit:
+                print(f"\nРаспределённый MGS пропущен: n={n} > dist_limit={dist_limit}")
+            else:
+                print(f"\nРаспределённый MGS пропущен: нет узлов")
+
+        # Вычисление метрик
         r_gauss = np.linalg.norm(A @ x_gauss - b)
         r_mgs_seq = np.linalg.norm(A @ x_mgs_seq - b)
 
-        # Ошибка относительно x_true
         e_gauss = np.linalg.norm(x_gauss - x_true)
         e_mgs_seq = np.linalg.norm(x_mgs_seq - x_true)
 
-        print(f"{gauss_label}: {t_gauss:.6f} c")
-        print(f"MGS   (последовательный): {t_mgs_seq:.6f} c")
+        test_result = {
+            'n': n,
+            't_gauss': t_gauss,
+            't_mgs_seq': t_mgs_seq,
+            't_mgs_dist': t_mgs_dist,
+            'r_gauss': r_gauss,
+            'r_mgs_seq': r_mgs_seq,
+            'e_gauss': e_gauss,
+            'e_mgs_seq': e_mgs_seq,
+            'speedup_seq': speedup_seq if t_mgs_dist else None,
+            'speedup_gauss': speedup_gauss if t_mgs_dist else None
+        }
 
         if x_mgs_dist is not None:
-            r_mgs_dist = np.linalg.norm(A @ x_mgs_dist - b)
-            e_mgs_dist = np.linalg.norm(x_mgs_dist - x_true)
+            test_result['r_mgs_dist'] = np.linalg.norm(A @ x_mgs_dist - b)
+            test_result['e_mgs_dist'] = np.linalg.norm(x_mgs_dist - x_true)
 
-            print(f"MGS   (распределённый):   {t_mgs_dist:.6f} c")
+        results.append(test_result)
 
-            print("\nНевязки:")
-            print(f"||A*x_gauss - b||    = {r_gauss:.6e}")
-            print(f"||A*x_mgs_seq - b||  = {r_mgs_seq:.6e}")
-            print(f"||A*x_mgs_dist - b|| = {r_mgs_dist:.6e}")
+        # Вывод результатов
+        print("\n" + "-" * 40)
+        print("РЕЗУЛЬТАТЫ ТЕСТА:")
+        print("-" * 40)
 
-            print("\nПогрешность относительно x_true:")
-            print(f"||x_gauss - x_true||    = {e_gauss:.6e}")
-            print(f"||x_mgs_seq - x_true||  = {e_mgs_seq:.6e}")
-            print(f"||x_mgs_dist - x_true|| = {e_mgs_dist:.6e}")
+        print(f"\nВремя выполнения:")
+        print(f"  {gauss_label}: {t_gauss:.6f} с")
+        print(f"  MGS (последовательный): {t_mgs_seq:.6f} с")
+        if t_mgs_dist:
+            print(f"  MGS (распределённый): {t_mgs_dist:.6f} с")
 
-            print("\nУскорение относительно распределённого MGS:")
-            print(f"S_seqMGS = {t_mgs_seq / t_mgs_dist:.6f}")
-            print(f"S_gauss  = {t_gauss / t_mgs_dist:.6f}")
+        print(f"\nНевязки ||Ax-b||:")
+        print(f"  Гаусс: {r_gauss:.6e}")
+        print(f"  MGS последовательный: {r_mgs_seq:.6e}")
+        if x_mgs_dist is not None:
+            print(f"  MGS распределённый: {test_result['r_mgs_dist']:.6e}")
+
+        print(f"\nПогрешность относительно x_true:")
+        print(f"  Гаусс: {e_gauss:.6e}")
+        print(f"  MGS последовательный: {e_mgs_seq:.6e}")
+        if x_mgs_dist is not None:
+            print(f"  MGS распределённый: {test_result['e_mgs_dist']:.6e}")
+
+        print(f"\n{'-' * 40}")
+        print(f"ТЕСТ {test_idx}/{total_tests} ЗАВЕРШЕН")
+        print(f"{'-' * 40}")
+
+    # Итоговые результаты
+    print("\n" + "=" * 60)
+    print("ИТОГОВЫЕ РЕЗУЛЬТАТЫ")
+    print("=" * 60)
+
+    print("\n{:<8} {:<15} {:<15} {:<15} {:<12}".format(
+        "n", "Гаусс (с)", "MGS посл (с)", "MGS распр (с)", "Ускорение"))
+    print("-" * 65)
+
+    for r in results:
+        if r['t_mgs_dist']:
+            print("{:<8} {:<15.6f} {:<15.6f} {:<15.6f} {:<12.2f}x".format(
+                r['n'], r['t_gauss'], r['t_mgs_seq'], r['t_mgs_dist'], r['speedup_seq']))
         else:
-            print("MGS   (распределённый):   ПРОПУЩЕН (n > dist_limit или нет узлов)")
+            print("{:<8} {:<15.6f} {:<15.6f} {:<15} {:<12}".format(
+                r['n'], r['t_gauss'], r['t_mgs_seq'], "N/A", "N/A"))
 
-            print("\nНевязки:")
-            print(f"||A*x_gauss - b||    = {r_gauss:.6e}")
-            print(f"||A*x_mgs_seq - b||  = {r_mgs_seq:.6e}")
-
-            print("\nПогрешность относительно x_true:")
-            print(f"||x_gauss - x_true||    = {e_gauss:.6e}")
-            print(f"||x_mgs_seq - x_true||  = {e_mgs_seq:.6e}")
+    print("=" * 60)
+    print("ТЕСТИРОВАНИЕ ЗАВЕРШЕНО")
+    print("=" * 60)
 
 
 def parse_nodes_file(path: str):
@@ -110,7 +177,7 @@ def parse_nodes_file(path: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Нагрузочный тест для решения СЛАУ")
+    parser = argparse.ArgumentParser(description="Нагрузочное тестирование решения СЛАУ")
     parser.add_argument(
         "--sizes",
         nargs="+",
@@ -126,8 +193,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dist-limit",
         type=int,
-        default=300,
-        help="Максимальная размерность для запуска TCP-распределённого MGS"
+        default=3000,
+        help="Максимальная размерность для распределённого MGS"
     )
     parser.add_argument(
         "--no-numpy-gauss-large",
@@ -137,7 +204,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-nodes",
         action="store_true",
-        help="Не использовать worker-узлы вообще"
+        help="Не использовать worker-узлы"
     )
     args = parser.parse_args()
 
