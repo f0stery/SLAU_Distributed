@@ -1,23 +1,35 @@
-import pytest
-import numpy as np
-import sys
-import os
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from master import split_rows
 
 
-class TestDistributed:
-    """Минимальные тесты для распределенной части"""
+def test_split_rows_even():
+    """Равномерное распределение строк."""
+    m = 12
+    num_parts = 3
 
-    def test_split_rows(self):
-        """Тест функции распределения строк"""
-        m = 10
-        num_parts = 3
+    ranges = split_rows(m, num_parts)
 
-        ranges = split_rows(m, num_parts)
+    assert len(ranges) == 3
+    total_rows = sum(end - start for start, end in ranges)
+    assert total_rows == m
 
-        assert len(ranges) == 3
-        # Проверяем, что покрыты все строки
-        total_rows = sum(end - start for start, end in ranges)
-        assert total_rows == m
+    # Проверяем непрерывность покрытия
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == m
+    for i in range(len(ranges) - 1):
+        assert ranges[i][1] == ranges[i + 1][0]
+
+
+def test_split_rows_uneven():
+    """Неравномерное распределение строк."""
+    m = 10
+    num_parts = 3
+
+    ranges = split_rows(m, num_parts)
+
+    assert len(ranges) == 3
+    total_rows = sum(end - start for start, end in ranges)
+    assert total_rows == m
+
+    # Разница между размерами блоков не должна быть больше 1
+    sizes = [end - start for start, end in ranges]
+    assert max(sizes) - min(sizes) <= 1
