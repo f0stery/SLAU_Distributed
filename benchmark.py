@@ -21,7 +21,6 @@ def run_benchmark(
         sizes: List[int],
         nodes: List[Tuple[str, int]],
         dist_limit: int,
-        use_numpy_gauss_large: bool = True
 ):
     total_tests = len(sizes)
 
@@ -197,11 +196,6 @@ if __name__ == "__main__":
         help="Максимальная размерность для распределённого MGS"
     )
     parser.add_argument(
-        "--no-numpy-gauss-large",
-        action="store_true",
-        help="Не использовать np.linalg.solve для больших n"
-    )
-    parser.add_argument(
         "--no-nodes",
         action="store_true",
         help="Не использовать worker-узлы"
@@ -216,5 +210,4 @@ if __name__ == "__main__":
         sizes=args.sizes,
         nodes=nodes,
         dist_limit=args.dist_limit,
-        use_numpy_gauss_large=not args.no_numpy_gauss_large
     )
